@@ -50,24 +50,30 @@
         <!-- Approval Stats -->
         <div class="approval-stats">
           <div class="stat-box">
-            <div class="stat-box-number">{{ rows|length }}</div>
+            <div id="stat-total" class="stat-box-number">{{ rows|length }}</div>
             <div class="stat-box-label">Total Records</div>
           </div>
           <div class="stat-box approved">
-            <div class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Approved')|list|length }}</div>
+            <div id="stat-approved" class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Approved')|list|length }}</div>
             <div class="stat-box-label">Approved</div>
           </div>
           <div class="stat-box pending">
-            <div class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Pending')|list|length }}</div>
+            <div id="stat-pending" class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Pending')|list|length }}</div>
             <div class="stat-box-label">Pending Review</div>
           </div>
           <div class="stat-box rejected">
-            <div class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Rejected')|list|length }}</div>
+            <div id="stat-rejected" class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Rejected')|list|length }}</div>
             <div class="stat-box-label">Rejected</div>
           </div>
         </div>
 
         <!-- Attendance Table -->
+        <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center;">
+          <button class="btn-custom btn-success-custom btn-sm-custom" onclick="bulkAction('Approved')">Approve Selected</button>
+          <button class="btn-custom btn-danger-custom btn-sm-custom" onclick="bulkAction('Rejected')">Reject Selected</button>
+          <button class="btn-custom btn-warning-custom btn-sm-custom" onclick="bulkAction('Pending')">Mark Selected Pending</button>
+          <div style="margin-left:auto;">Sort: <a href="?sort=roll">Roll</a> | <a href="?sort=scanned_at">Scanned At</a></div>
+        </div>
         <div class="mt-4">
           <h3 class="heading-tertiary mb-3">Attendance Records</h3>
           {% if rows %}
@@ -75,6 +81,7 @@
             <table class="table-custom">
               <thead>
                 <tr>
+                  <th style="width:40px"><input type="checkbox" id="selectAll" onclick="toggleAll(this)"></th>
                   <th>Roll Number</th>
                   <th>Student Name</th>
                   <th>Branch</th>
@@ -86,6 +93,7 @@
               <tbody>
                 {% for r in rows %}
                 <tr id="row-{{ r.id }}">
+                  <td><input type="checkbox" class="sel" value="{{ r.id }}"></td>
                   <td><strong>{{ r.roll }}</strong></td>
                   <td>{{ r.student_name or "Unknown" }}</td>
                   <td>{{ r.branch or "-" }}</td>
@@ -151,11 +159,44 @@
   </div>
 
   <script>
+  function toggleAll(cb){
+    const checked = cb.checked;
+    document.querySelectorAll('input.sel').forEach(i => i.checked = checked);
+  }
+
+  function getSelectedIds(){
+    return Array.from(document.querySelectorAll('input.sel:checked')).map(i => i.value);
+  }
+
+  function bulkAction(action){
+    const ids = getSelectedIds();
+    if(!ids.length){
+      alert('Please select at least one record');
+      return;
+    }
+    if(!confirm(`Perform '${action}' on ${ids.length} selected records?`)) return;
+    fetch('/hod_bulk_action',{
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({attendance_ids: ids, action: action})
+    }).then(r=>r.json()).then(js=>{
+      if(js.ok){
+        // reload to reflect changes
+        location.reload();
+      } else {
+        alert('Error performing bulk action');
+      }
+    }).catch(e=>{console.error(e); alert('Network error')});
+  }
+
   function hodAction(attId, action) {
     const statusCell = document.getElementById("status-" + attId);
     const ApproveBtn = document.getElementById("Approve-" + attId);
     const ReviewBtn = document.getElementById("Review-" + attId);
     const RejectBtn = document.getElementById("Reject-" + attId);
+
+    // capture previous status to update stats counts
+    const prevStatus = statusCell ? statusCell.innerText.trim() : null;
 
     fetch("/hod_action", {
       method: "POST",
@@ -173,9 +214,24 @@
         ApproveBtn.style.display = action === "Approved" ? "none" : "inline-flex";
         ReviewBtn.style.display = action === "Pending" ? "none" : "inline-flex";
         RejectBtn.style.display = action === "Rejected" ? "none" : "inline-flex";
-        
-        // Reload to update stats
-        setTimeout(() => location.reload(), 500);
+
+        // Update counts in the stats widgets without full reload
+        try {
+          function updateCount(id, delta) {
+            const el = document.getElementById(id);
+            if(!el) return;
+            el.textContent = (parseInt(el.textContent) || 0) + delta;
+          }
+          const mapId = { 'Approved': 'stat-approved', 'Pending': 'stat-pending', 'Rejected': 'stat-rejected' };
+          if (prevStatus && prevStatus !== action) {
+            // decrement previous
+            const prevId = mapId[prevStatus] || null;
+            const newId = mapId[action] || null;
+            if (prevId) updateCount(prevId, -1);
+            if (newId) updateCount(newId, 1);
+          }
+        } catch (e) { console.error('Error updating stats:', e); }
+
       } else {
         alert("Error updating attendance status.");
       }

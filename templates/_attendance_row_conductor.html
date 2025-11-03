@@ -1,0 +1,11 @@
+<tr id="row-{{ r.id }}">
+  <td><strong>{{ r.roll }}</strong></td>
+  <td>{{ r.student_name or "Unknown" }}</td>
+  <td>{{ r.branch or "-" }}</td>
+  <td>{{ r.scanned_at }}</td>
+  <td>
+    <span class="status-badge status-{{ r.status|lower }}">
+      {{ r.status }}
+    </span>
+  </td>
+</tr>

@@ -51,15 +51,15 @@
         <!-- Stats -->
         <div class="attendance-stats">
           <div class="stat-box">
-            <div class="stat-box-number">{{ rows|length }}</div>
+            <div id="stat-total" class="stat-box-number">{{ rows|length }}</div>
             <div class="stat-box-label">Total Scans</div>
           </div>
           <div class="stat-box">
-            <div class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Pending')|list|length }}</div>
+            <div id="stat-pending" class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Pending')|list|length }}</div>
             <div class="stat-box-label">Pending</div>
           </div>
           <div class="stat-box">
-            <div class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Approved')|list|length }}</div>
+            <div id="stat-approved" class="stat-box-number">{{ rows|selectattr('status', 'equalto', 'Approved')|list|length }}</div>
             <div class="stat-box-label">Approved</div>
           </div>
         </div>
@@ -168,12 +168,27 @@
                 body: JSON.stringify({ event_id: eventId, roll: decodedText })
               }).then(res => res.json()).then(js => {
                 const tb = document.getElementById("attendanceTable");
-                const tr = document.createElement("tr");
-                tr.innerHTML = `<td><strong>${decodedText}</strong></td><td>${name}</td><td>${branch}</td><td>${js.scanned_at}</td><td><span class="status-badge status-pending">Pending</span></td>`;
-                tb.prepend(tr);
-                
-                // Update stats
-                location.reload();
+                if (js.row_html) {
+                  // insert server-rendered row HTML at top
+                  tb.insertAdjacentHTML('afterbegin', js.row_html);
+                } else {
+                  // fallback to client-rendered row
+                  const tr = document.createElement("tr");
+                  tr.innerHTML = `<td><strong>${decodedText}</strong></td><td>${name}</td><td>${branch}</td><td>${js.scanned_at}</td><td><span class="status-badge status-pending">Pending</span></td>`;
+                  tb.prepend(tr);
+                }
+
+                // Update stats using returned counts (more accurate)
+                try {
+                  if (js.counts) {
+                    const totalEl = document.getElementById('stat-total');
+                    const pendingEl = document.getElementById('stat-pending');
+                    const approvedEl = document.getElementById('stat-approved');
+                    if (totalEl && typeof js.counts.total !== 'undefined') totalEl.textContent = js.counts.total;
+                    if (pendingEl && typeof js.counts.pending !== 'undefined') pendingEl.textContent = js.counts.pending;
+                    if (approvedEl && typeof js.counts.approved !== 'undefined') approvedEl.textContent = js.counts.approved;
+                  }
+                } catch (e) { console.error('Error updating stats:', e); }
               });
             }
           });

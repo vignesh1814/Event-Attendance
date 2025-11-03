@@ -12,9 +12,39 @@ import sqlite3
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 import os
-
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from apscheduler.schedulers.background import BackgroundScheduler
+from pytz import timezone
+from email_service import send_hod_attendance_reports, INDIA_TZ
 DB = "database.db"
 app = Flask(__name__)
+# Initialize scheduler
+scheduler = BackgroundScheduler(timezone=INDIA_TZ)
+
+# Schedule email jobs
+@scheduler.scheduled_job('cron', hour=12, minute=30)
+def noon_email_job():
+    with get_db_connection() as conn:
+        send_hod_attendance_reports(conn, "12:30")
+
+@scheduler.scheduled_job('cron', hour=16, minute=0)
+def evening_email_job():
+    with get_db_connection() as conn:
+        send_hod_attendance_reports(conn, "16:00")
+
+# Email Configuration - Using environment variables for security
+GMAIL_USERNAME = os.environ.get('GMAIL_USERNAME', 'mr.ani30617@gmail.com')
+GMAIL_APP_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', 'mzxn betc efrh rlto')  # Set this using environment variable
+INDIA_TZ = timezone('Asia/Kolkata')
+
+# Only start scheduler if email is configured; otherwise skip to avoid repeated failures
+if not GMAIL_APP_PASSWORD:
+    print("[warning] GMAIL_APP_PASSWORD is not set. Email scheduler will NOT start. Set the environment variable and restart the app to enable email sending.")
+else:
+    scheduler.start()
+
 app.secret_key = "dev-secret-change-this"  # change for production
 
 
@@ -75,6 +105,14 @@ def init_db():
         hod_id INTEGER,
         hod_action_at TEXT
     );
+    
+    CREATE TABLE sent_emails (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attendance_id INTEGER,
+        sent_at TEXT,
+        email_time TEXT, -- '12:30' or '16:20' to track which batch
+        UNIQUE(attendance_id, email_time)
+    );
     """)
     # seed users
     cur.execute(
@@ -107,7 +145,7 @@ def current_user():
     try:
         with get_db_connection() as conn:
             u = conn.execute(
-                "SELECT id,name,email,role FROM users WHERE id=?", (uid,)
+                "SELECT id,name,email,role,branch FROM users WHERE id=?", (uid,)
             ).fetchone()
             return u
     except sqlite3.OperationalError as e:
@@ -187,16 +225,27 @@ def dashboard():
     try:
         with get_db_connection() as conn:
             if user["role"] == "conductor":
-                events = conn.execute(
-                    "SELECT * FROM events WHERE creator_id=? ORDER BY id DESC", (user["id"],)
-                ).fetchall()
+                # allow optional sorting for conductor's events (by when_dt or title)
+                ev_sort = request.args.get('sort', 'when_dt')
+                if ev_sort == 'title':
+                    events = conn.execute(
+                        "SELECT * FROM events WHERE creator_id=? ORDER BY title ASC", (user["id"],)
+                    ).fetchall()
+                else:
+                    events = conn.execute(
+                        "SELECT * FROM events WHERE creator_id=? ORDER BY when_dt DESC", (user["id"],)
+                    ).fetchall()
                 print(events)
                 return render_template("conductor_dashboard.html", user=user, events=events)
             elif user["role"] == "student":
                 print("Student")
             elif user["role"] == "hod":
-                # hod sees all events
-                events = conn.execute("SELECT * FROM events ORDER BY id DESC").fetchall()
+                # hod sees all events; support simple sorting
+                ev_sort = request.args.get('sort', 'when_dt')
+                if ev_sort == 'title':
+                    events = conn.execute("SELECT * FROM events ORDER BY title ASC").fetchall()
+                else:
+                    events = conn.execute("SELECT * FROM events ORDER BY when_dt DESC").fetchall()
                 print("here: ",events)
                 return render_template("hod_dashboard.html", user=user, events=events)
     except sqlite3.OperationalError as e:
@@ -236,17 +285,36 @@ def view_event(event_id):
             event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
             if not event:
                 return "Event not found", 404
-            # get attendance rows
-            rows = conn.execute(
-                "SELECT a.*, s.name as student_name, s.branch as branch FROM attendance a LEFT JOIN students s ON a.roll=s.roll WHERE event_id=? ORDER BY scanned_at DESC",
-                (event_id,),
-            ).fetchall()
-            # Different template view for conductor vs hod
+            # Different query depending on role: HODs should only see students from their branch
             if user["role"] == "conductor":
+                # allow optional sorting of attendance list
+                sort = request.args.get('sort', 'roll')
+                if sort == 'scanned_at':
+                    order_sql = 'a.scanned_at DESC'
+                else:
+                    order_sql = 's.roll ASC'
+                rows = conn.execute(
+                    f"SELECT a.*, s.name as student_name, s.branch as branch FROM attendance a LEFT JOIN students s ON a.roll=s.roll WHERE event_id=? ORDER BY {order_sql}",
+                    (event_id,),
+                ).fetchall()
                 return render_template(
                     "conductor_event.html", user=user, event=event, rows=rows
                 )
+            elif user["role"] == "hod":
+                # only show attendance for students in this HOD's branch
+                sort = request.args.get('sort', 'roll')
+                if sort == 'scanned_at':
+                    order_sql = 'a.scanned_at DESC'
+                else:
+                    order_sql = 's.roll ASC'
+                rows = conn.execute(
+                    f"SELECT a.*, s.name as student_name, s.branch as branch FROM attendance a LEFT JOIN students s ON a.roll=s.roll WHERE event_id=? AND s.branch=? ORDER BY {order_sql}",
+                    (event_id, user["branch"]),
+                ).fetchall()
+                return render_template("hod_event.html", user=user, event=event, rows=rows)
             else:
+                # default: show nothing
+                rows = []
                 return render_template("hod_event.html", user=user, event=event, rows=rows)
     except sqlite3.OperationalError as e:
         flash("Database error. Please try again.", "danger")
@@ -297,12 +365,31 @@ def add_scan():
     scanned_at = datetime.utcnow().isoformat()
     try:
         with get_db_connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO attendance (event_id,roll,scanned_at,conductor_id,status) VALUES (?,?,?,?,?)",
                 (event_id, roll, scanned_at, user["id"], "Pending"),
             )
             conn.commit()
-            return jsonify({"ok": True, "scanned_at": scanned_at})
+            # fetch the inserted row with joined student info
+            inserted_id = cur.lastrowid
+            row = conn.execute(
+                "SELECT a.*, s.name as student_name, s.branch as branch FROM attendance a LEFT JOIN students s ON a.roll=s.roll WHERE a.id=?",
+                (inserted_id,),
+            ).fetchone()
+            # compute updated counts for the event
+            total = conn.execute("SELECT COUNT(*) as c FROM attendance WHERE event_id=?", (event_id,)).fetchone()["c"]
+            pending = conn.execute("SELECT COUNT(*) as c FROM attendance WHERE event_id=? AND status='Pending'", (event_id,)).fetchone()["c"]
+            approved = conn.execute("SELECT COUNT(*) as c FROM attendance WHERE event_id=? AND status='Approved'", (event_id,)).fetchone()["c"]
+            # render a small HTML fragment for the new row
+            from flask import render_template
+
+            row_html = render_template("_attendance_row_conductor.html", r=row)
+            return jsonify({
+                "ok": True,
+                "scanned_at": scanned_at,
+                "row_html": row_html,
+                "counts": {"total": total, "pending": pending, "approved": approved},
+            })
     except sqlite3.OperationalError as e:
         print(f"Database error in add_scan: {e}")
         return jsonify({"error": "database error"}), 500
@@ -342,5 +429,30 @@ def hod_action():
         return jsonify({"error": "database error"}), 500
 
 
+@app.route("/hod_bulk_action", methods=["POST"])
+def hod_bulk_action():
+    """Update multiple attendance rows at once. Expects JSON: { attendance_ids: [1,2,3], action: 'Approved'|'Rejected'|'Pending' }"""
+    user = current_user()
+    if not user or user["role"] != "hod":
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json()
+    attendance_ids = payload.get("attendance_ids") or []
+    action = payload.get("action")
+    if not attendance_ids or action not in ("Approved", "Rejected", "Pending"):
+        return jsonify({"error": "invalid request"}), 400
+
+    t = datetime.utcnow().isoformat()
+    try:
+        with get_db_connection() as conn:
+            q = "UPDATE attendance SET status=?, hod_id=?, hod_action_at=? WHERE id=?"
+            for aid in attendance_ids:
+                conn.execute(q, (action, user["id"], t, aid))
+            conn.commit()
+            return jsonify({"ok": True, "updated": attendance_ids})
+    except sqlite3.OperationalError as e:
+        print(f"Database error in hod_bulk_action: {e}")
+        return jsonify({"error": "database error"}), 500
+
+
 if __name__ == "__main__":
-    app.run(debug=True,host='0.0.0.0',port=4112)
+    app.run(debug=True,port=4112)
