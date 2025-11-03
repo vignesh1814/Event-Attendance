@@ -19,9 +19,20 @@ app.secret_key = "dev-secret-change-this"  # change for production
 
 
 def get_db():
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=20)  # Add timeout for busy database
     conn.row_factory = sqlite3.Row
     return conn
+
+def get_db_connection():
+    """Context manager for database connections"""
+    conn = None
+    try:
+        conn = get_db()
+        return conn
+    except Exception as e:
+        if conn:
+            conn.close()
+        raise e
 
 
 def init_db():
@@ -93,12 +104,15 @@ def current_user():
     uid = session.get("user_id")
     if not uid:
         return None
-    conn = get_db()
-    u = conn.execute(
-        "SELECT id,name,email,role FROM users WHERE id=?", (uid,)
-    ).fetchone()
-    conn.close()
-    return u
+    try:
+        with get_db_connection() as conn:
+            u = conn.execute(
+                "SELECT id,name,email,role FROM users WHERE id=?", (uid,)
+            ).fetchone()
+            return u
+    except sqlite3.OperationalError as e:
+        print(f"Database error in current_user: {e}")
+        return None
 
 
 ### Routes
@@ -117,14 +131,17 @@ def login():
     if request.method == "POST":
         email = request.form["email"].strip()
         pw = request.form["password"]
-        conn = get_db()
-        row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        conn.close()
-        if row and (row["password_hash"], pw):
-            session["user_id"] = row["id"]
-            flash("Logged in successfully.", "success")
-            return redirect(url_for("dashboard"))
-        flash("Invalid credentials", "danger")
+        try:
+            with get_db_connection() as conn:
+                row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+                if row and (row["password_hash"], pw):
+                    session["user_id"] = row["id"]
+                    flash("Logged in successfully.", "success")
+                    return redirect(url_for("dashboard"))
+                flash("Invalid credentials", "danger")
+        except sqlite3.OperationalError as e:
+            flash("Database error. Please try again.", "danger")
+            print(f"Database error in login: {e}")
     return render_template("login.html")
 
 
@@ -140,15 +157,20 @@ def register():
         if password != confirm_password:
             flash("Passwords do not match!", "danger")
             return redirect(url_for("register"))
-        # Save to DB here
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO users (name,email,password_hash,role,branch) VALUES (?,?,?,?,?)",(name,email,password,role,branch),
-        )
-        conn.commit()
-        conn.close()
-        flash("Registered successfully! Please log in.", "success")
-        return redirect(url_for("login"))
+        try:
+            with get_db_connection() as conn:
+                conn.execute(
+                    "INSERT INTO users (name,email,password_hash,role,branch) VALUES (?,?,?,?,?)",
+                    (name, email, password, role, branch),
+                )
+                conn.commit()
+                flash("Registered successfully! Please log in.", "success")
+                return redirect(url_for("login"))
+        except sqlite3.OperationalError as e:
+            flash("Database error. Please try again.", "danger")
+            print(f"Database error in register: {e}")
+        except sqlite3.IntegrityError:
+            flash("Email already registered!", "danger")
     return render_template("register.html")
 
 @app.route("/logout")
@@ -162,18 +184,25 @@ def dashboard():
     user = current_user()
     if not user:
         return redirect(url_for("login"))
-    conn = get_db()
-    if user["role"] == "conductor":
-        events = conn.execute(
-            "SELECT * FROM events WHERE creator_id=? ORDER BY id DESC", (user["id"],)
-        ).fetchall()
-        conn.close()
-        return render_template("conductor_dashboard.html", user=user, events=events)
-    else:
-        # hod sees all events
-        events = conn.execute("SELECT * FROM events ORDER BY id DESC").fetchall()
-        conn.close()
-        return render_template("hod_dashboard.html", user=user, events=events)
+    try:
+        with get_db_connection() as conn:
+            if user["role"] == "conductor":
+                events = conn.execute(
+                    "SELECT * FROM events WHERE creator_id=? ORDER BY id DESC", (user["id"],)
+                ).fetchall()
+                print(events)
+                return render_template("conductor_dashboard.html", user=user, events=events)
+            elif user["role"] == "student":
+                print("Student")
+            elif user["role"] == "hod":
+                # hod sees all events
+                events = conn.execute("SELECT * FROM events ORDER BY id DESC").fetchall()
+                print("here: ",events)
+                return render_template("hod_dashboard.html", user=user, events=events)
+    except sqlite3.OperationalError as e:
+        flash("Database error. Please try again.", "danger")
+        print(f"Database error in dashboard: {e}")
+        return redirect(url_for("index"))
 
 
 @app.route("/create_event", methods=["GET", "POST"])
@@ -202,24 +231,27 @@ def view_event(event_id):
     user = current_user()
     if not user:
         return redirect(url_for("login"))
-    conn = get_db()
-    event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
-    if not event:
-        conn.close()
-        return "Event not found", 404
-    # get attendance rows
-    rows = conn.execute(
-        "SELECT a.*, s.name as student_name, s.branch as branch FROM attendance a LEFT JOIN students s ON a.roll=s.roll WHERE event_id=? ORDER BY scanned_at DESC",
-        (event_id,),
-    ).fetchall()
-    conn.close()
-    # Different template view for conductor vs hod
-    if user["role"] == "conductor":
-        return render_template(
-            "conductor_event.html", user=user, event=event, rows=rows
-        )
-    else:
-        return render_template("hod_event.html", user=user, event=event, rows=rows)
+    try:
+        with get_db_connection() as conn:
+            event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+            if not event:
+                return "Event not found", 404
+            # get attendance rows
+            rows = conn.execute(
+                "SELECT a.*, s.name as student_name, s.branch as branch FROM attendance a LEFT JOIN students s ON a.roll=s.roll WHERE event_id=? ORDER BY scanned_at DESC",
+                (event_id,),
+            ).fetchall()
+            # Different template view for conductor vs hod
+            if user["role"] == "conductor":
+                return render_template(
+                    "conductor_event.html", user=user, event=event, rows=rows
+                )
+            else:
+                return render_template("hod_event.html", user=user, event=event, rows=rows)
+    except sqlite3.OperationalError as e:
+        flash("Database error. Please try again.", "danger")
+        print(f"Database error in view_event: {e}")
+        return redirect(url_for("dashboard"))
 
 
 # AJAX endpoint used by scanner to fetch student details by roll
@@ -232,22 +264,25 @@ def scan_lookup():
     roll = data.get("roll", "").strip()
     if not roll:
         return jsonify({"error": "no roll"}), 400
-    conn = get_db()
-    student = conn.execute(
-        "SELECT roll,name,branch FROM students WHERE roll=?", (roll,)
-    ).fetchone()
-    conn.close()
-    if student:
-        # return details so they can be Reviewed before adding to "Pending list"
-        return jsonify(
-            {
-                "roll": student["roll"],
-                "name": student["name"],
-                "branch": student["branch"],
-            }
-        )
-    else:
-        return jsonify({"roll": roll, "name": None, "branch": None})
+    try:
+        with get_db_connection() as conn:
+            student = conn.execute(
+                "SELECT roll,name,branch FROM students WHERE roll=?", (roll,)
+            ).fetchone()
+            if student:
+                # return details so they can be Reviewed before adding to "Pending list"
+                return jsonify(
+                    {
+                        "roll": student["roll"],
+                        "name": student["name"],
+                        "branch": student["branch"],
+                    }
+                )
+            else:
+                return jsonify({"roll": roll, "name": None, "branch": None})
+    except sqlite3.OperationalError as e:
+        print(f"Database error in scan_lookup: {e}")
+        return jsonify({"error": "database error"}), 500
 
 
 # When conductor confirms a scanned student locally, save it to DB with scanned_at and Pending status
@@ -260,14 +295,17 @@ def add_scan():
     event_id = payload.get("event_id")
     roll = payload.get("roll")
     scanned_at = datetime.utcnow().isoformat()
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO attendance (event_id,roll,scanned_at,conductor_id,status) VALUES (?,?,?,?,?)",
-        (event_id, roll, scanned_at, user["id"], "Pending"),
-    )
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "scanned_at": scanned_at})
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO attendance (event_id,roll,scanned_at,conductor_id,status) VALUES (?,?,?,?,?)",
+                (event_id, roll, scanned_at, user["id"], "Pending"),
+            )
+            conn.commit()
+            return jsonify({"ok": True, "scanned_at": scanned_at})
+    except sqlite3.OperationalError as e:
+        print(f"Database error in add_scan: {e}")
+        return jsonify({"error": "database error"}), 500
 
 
 # HOD Approves/Rejects attendance
@@ -280,26 +318,28 @@ def hod_action():
     attendance_id = payload.get("attendance_id")
     action = payload.get("action")  # Approve or Reject
     t = datetime.utcnow().isoformat()
-    conn = get_db()
-    if action == "Approved":
-        conn.execute(
-            "UPDATE attendance SET status='Approved', hod_id=?, hod_action_at=? WHERE id=?",
-            (user["id"], t, attendance_id),
-        )
-    elif action == "Pending":
-        conn.execute(
-            "UPDATE attendance SET status='Pending', hod_id=?, hod_action_at=? WHERE id=?",
-            (user["id"], t, attendance_id),
-        )
-
-    elif action == "Rejected":
-        conn.execute(
-            "UPDATE attendance SET status='Rejected', hod_id=?, hod_action_at=? WHERE id=?",
-            (user["id"], t, attendance_id),
-        )
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
+    try:
+        with get_db_connection() as conn:
+            if action == "Approved":
+                conn.execute(
+                    "UPDATE attendance SET status='Approved', hod_id=?, hod_action_at=? WHERE id=?",
+                    (user["id"], t, attendance_id),
+                )
+            elif action == "Pending":
+                conn.execute(
+                    "UPDATE attendance SET status='Pending', hod_id=?, hod_action_at=? WHERE id=?",
+                    (user["id"], t, attendance_id),
+                )
+            elif action == "Rejected":
+                conn.execute(
+                    "UPDATE attendance SET status='Rejected', hod_id=?, hod_action_at=? WHERE id=?",
+                    (user["id"], t, attendance_id),
+                )
+            conn.commit()
+            return jsonify({"ok": True})
+    except sqlite3.OperationalError as e:
+        print(f"Database error in hod_action: {e}")
+        return jsonify({"error": "database error"}), 500
 
 
 if __name__ == "__main__":
