@@ -78,18 +78,6 @@ if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
         client_kwargs={'scope': 'openid email profile'},
     )
 
-# Migration: rename role 'conductor' -> 'organiser' without deleting data
-def migrate_rename_conductor_to_organiser():
-    try:
-        with get_db_connection() as conn:
-            conn.execute("UPDATE users SET role='organiser' WHERE role='conductor'")
-            conn.commit()
-            print("DB migration: renamed 'conductor' -> 'organiser' (if any)")
-    except Exception as e:
-        print("Migration error:", e)
-
-migrate_rename_conductor_to_organiser()
-
 
 # --- Google OAuth routes ---
 @app.route('/login/google')
@@ -161,7 +149,7 @@ def init_db():
         return
     conn = get_db()
     cur = conn.cursor()
-    # users: role is 'conductor' or 'hod'
+    # users: role is 'organiser' or 'hod'
     cur.executescript("""
     CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,7 +178,7 @@ def init_db():
         event_id INTEGER,
         roll TEXT,
         scanned_at TEXT,
-        conductor_id INTEGER,
+        organiser_id INTEGER,
         status TEXT DEFAULT 'Pending', -- Pending / Approved / Rejected
         hod_id INTEGER,
         hod_action_at TEXT
@@ -204,20 +192,6 @@ def init_db():
         UNIQUE(attendance_id, email_time)
     );
     """)
-    # seed users
-    cur.execute(
-        "INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,?)",
-        (
-            "Event Conductor",
-            "conductor@example.com",
-            "pass",
-            "conductor",
-        ),
-    )
-    cur.execute(
-        "INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,?)",
-        ("Head of Dept", "hod@example.com", "pass", "hod"),
-    )
     conn.commit()
     conn.close()
     print("DB initialized at", DB)
@@ -328,8 +302,8 @@ def dashboard():
         return redirect(url_for("login"))
     try:
         with get_db_connection() as conn:
-            if user["role"] in ("organiser","conductor"):
-                # allow optional sorting for conductor's events (by when_dt or title)
+            if user["role"] in ("organiser"):
+                # allow optional sorting for organiser's events (by when_dt or title)
                 ev_sort = request.args.get('sort', 'when_dt')
                 if ev_sort == 'title':
                     order_clause = 'ORDER BY title ASC'
@@ -346,9 +320,45 @@ def dashboard():
                     (user["id"],),
                 ).fetchall()
                 print(events)
-                return render_template("conductor_dashboard.html", user=user, events=events)
-            elif user["role"] == "student":
+                return render_template("organiser_dashboard.html", user=user, events=events)
+            
+            elif user["role"].lower() == "student":
                 print("Student")
+                # Get the student's roll number from the user or session
+                roll = user["email"].split("@")[0].upper()  # assuming email = roll@vnrvjiet.in
+
+                # Sort by event title or date (optional, same logic as before)
+                ev_sort = request.args.get("sort", "when_dt")
+                if ev_sort == "title":
+                    order_clause = "ORDER BY e.title ASC"
+                else:
+                    order_clause = "ORDER BY e.when_dt DESC"
+
+                # Fetch attendance records for this specific student
+                query = f"""
+                    SELECT 
+                        e.title,
+                        e.when_dt,
+                        a.scanned_at,
+                        a.status
+                    FROM attendance a
+                    JOIN events e ON a.event_id = e.id
+                    WHERE a.roll = ?
+                    {order_clause};
+                """
+                rows = conn.execute(query, (roll,)).fetchall()
+
+                # Debug print
+                print(f"Attendance records for {roll}: ", rows)
+
+                # Render the student dashboard
+                return render_template(
+                    "student_dashboard.html",
+                    user=user,
+                    roll=roll,
+                    rows=rows
+                )
+
             elif user["role"] == "hod":
                 # hod sees all events; support simple sorting
                 ev_sort = request.args.get('sort', 'when_dt')
@@ -375,7 +385,7 @@ def dashboard():
 @app.route("/create_event", methods=["GET", "POST"])
 def create_event():
     user = current_user()
-    if not user or user["role"] != "conductor":
+    if not user or user["role"] != "organiser":
         return redirect(url_for("login"))
     if request.method == "POST":
         title = request.form["title"]
@@ -404,7 +414,7 @@ def view_event(event_id):
             if not event:
                 return "Event not found", 404
             # Different query depending on role: HODs should only see students from their branch
-            if user["role"] in ("organiser","conductor"):
+            if user["role"] in ("organiser"):
                 # allow optional sorting of attendance list
                 sort = request.args.get('sort', 'roll')
                 if sort == 'scanned_at':
@@ -416,7 +426,7 @@ def view_event(event_id):
                     (event_id,),
                 ).fetchall()
                 return render_template(
-                    "conductor_event.html", user=user, event=event, rows=rows
+                    "organiser_event.html", user=user, event=event, rows=rows
                 )
             elif user["role"] == "hod":
                 # only show attendance for students in this HOD's branch
@@ -444,7 +454,7 @@ def view_event(event_id):
 @app.route("/scan_lookup", methods=["POST"])
 def scan_lookup():
     user = current_user()
-    if not user or user["role"] not in ("organiser","conductor"):
+    if not user or user["role"] not in ("organiser"):
         return jsonify({"error": "unauthorized"}), 401
     data = request.get_json()
     roll = data.get("roll", "").strip()
@@ -471,11 +481,11 @@ def scan_lookup():
         return jsonify({"error": "database error"}), 500
 
 
-# When conductor confirms a scanned student locally, save it to DB with scanned_at and Pending status
+# When organiser confirms a scanned student locally, save it to DB with scanned_at and Pending status
 @app.route("/add_scan", methods=["POST"])
 def add_scan():
     user = current_user()
-    if not user or user["role"] not in ("organiser","conductor"):
+    if not user or user["role"] not in ("organiser"):
         return jsonify({"error": "unauthorized"}), 401
     payload = request.get_json()
     event_id = payload.get("event_id")
@@ -484,7 +494,7 @@ def add_scan():
     try:
         with get_db_connection() as conn:
             cur = conn.execute(
-                "INSERT INTO attendance (event_id,roll,scanned_at,conductor_id,status) VALUES (?,?,?,?,?)",
+                "INSERT INTO attendance (event_id,roll,scanned_at,organiser_id,status) VALUES (?,?,?,?,?)",
                 (event_id, roll, scanned_at, user["id"], "Pending"),
             )
             conn.commit()
@@ -501,7 +511,7 @@ def add_scan():
             # render a small HTML fragment for the new row
             from flask import render_template
 
-            row_html = render_template("_attendance_row_conductor.html", r=row)
+            row_html = render_template("_attendance_row_organiser.html", r=row)
             return jsonify({
                 "ok": True,
                 "scanned_at": scanned_at,

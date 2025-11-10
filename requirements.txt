@@ -4,5 +4,4 @@ APScheduler==3.10.1
 pytz==2023.3
 python-dotenv==1.0.0
 Authlib==1.2.0
-
-
+requests
